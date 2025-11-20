@@ -18,6 +18,8 @@ import requests
 
 # Импорт news_tool из той же папки dags
 from news_tool import get_news_titles, register_news_tool, execute_news_tool
+# Импорт weather_tool
+from weather_tool import get_weather, register_weather_tool, execute_weather_tool
 
 # Настройки по умолчанию для DAG
 default_args = {
@@ -25,8 +27,7 @@ default_args = {
     'depends_on_past': False,
     'email_on_failure': True,
     'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 0,  # Без повторных попыток - при ошибке DAG сразу падает
 }
 
 
@@ -73,6 +74,128 @@ def get_news_task(**context) -> Dict[str, Any]:
         
     except Exception as e:
         raise Exception(f"Ошибка в задаче получения новостей: {str(e)}")
+
+
+def get_weather_and_aphorism_task(**context) -> Dict[str, Any]:
+    """
+    Получает погоду в Санкт-Петербурге и создает афоризм через GigaChat.
+    
+    Returns:
+        dict: Словарь с данными о погоде и афоризмом
+        
+    Raises:
+        Exception: Если не удалось получить погоду или создать афоризм
+    """
+    # Координаты Санкт-Петербурга
+    SPB_LATITUDE = 59.9343
+    SPB_LONGITUDE = 30.3351
+    
+    # Получаем погоду
+    weather_data = get_weather(SPB_LATITUDE, SPB_LONGITUDE)
+    
+    # Проверяем наличие ошибки - если есть, падаем с исключением
+    if 'error' in weather_data:
+        error_msg = weather_data.get('error', 'Unknown error')
+        raise Exception(f"Ошибка при получении погоды: {error_msg}")
+    
+    # Извлекаем данные о погоде
+    temperature = weather_data.get('temperature')
+    condition = weather_data.get('condition')
+    wind_speed = weather_data.get('wind_speed')
+    humidity = weather_data.get('humidity')
+    
+    # Проверяем, что получили хотя бы температуру
+    if temperature is None:
+        raise Exception("Не удалось получить данные о температуре из ответа сервера погоды")
+    
+    # Импортируем GigaChat
+    try:
+        from gigachat import GigaChat
+        from gigachat.models import Chat, Messages, MessagesRole
+    except ImportError:
+        raise ImportError(
+            "Библиотека gigachat не установлена. "
+            "Установите её: pip install gigachat"
+        )
+    
+    # Инициализация GigaChat клиента
+    if not GIGACHAT_CREDENTIALS:
+        raise Exception(
+            "Не указаны учетные данные GigaChat. "
+            "Установите Airflow Variable GIGACHAT_CREDENTIALS"
+        )
+    
+    # Получаем Authorization Key из Airflow Variables GIGACHAT_CREDENTIALS
+    credentials_value = GIGACHAT_CREDENTIALS.strip()
+    credentials_value = credentials_value.replace('\r', '').replace('\n', '').replace('\t', '')
+    credentials_value = ''.join(credentials_value.split())
+    
+    if not credentials_value:
+        raise Exception("Authorization Key пустой. Установите Airflow Variable GIGACHAT_CREDENTIALS")
+    
+    # Создаем клиент GigaChat
+    client = GigaChat(credentials=credentials_value, verify_ssl_certs=False)
+    
+    # Формируем промпт для создания афоризма
+    prompt = f"""Создай короткий и остроумный афоризм на русском языке про погоду в Санкт-Петербурге.
+
+Текущая погода в Санкт-Петербурге:
+- Температура: {temperature}°C
+- Условия: {condition}
+- Скорость ветра: {wind_speed} м/с
+- Влажность: {humidity}%
+
+Афоризм должен быть:
+- Коротким (1-2 предложения)
+- Остроумным и связанным с Питером
+- Упоминать температуру или погодные условия
+- В стиле петербургского юмора
+
+Просто верни афоризм без дополнительных пояснений."""
+    
+    # Создаем сообщения для чата
+    messages = [
+        Messages(role=MessagesRole.USER, content=prompt)
+    ]
+    
+    # Создаем объект Chat
+    chat = Chat(
+        messages=messages,
+        model=GIGACHAT_MODEL,
+        temperature=0.8,  # Немного выше для креативности
+    )
+    
+    # Отправляем запрос в GigaChat
+    response = client.chat(chat)
+    
+    # Извлекаем афоризм
+    aphorism = ""
+    if hasattr(response, 'choices') and response.choices:
+        message = response.choices[0].message
+        aphorism = getattr(message, 'content', str(message)) if hasattr(message, 'content') else str(message)
+    else:
+        raise Exception(f"Неожиданный формат ответа от GigaChat: {response}")
+    
+    # Проверяем, что афоризм успешно создан
+    if not aphorism or not aphorism.strip():
+        raise Exception("GigaChat вернул пустой афоризм")
+    
+    # Формируем результат
+    result = {
+        'weather': {
+            'temperature': temperature,
+            'condition': condition,
+            'wind_speed': wind_speed,
+            'humidity': humidity,
+            'city': 'Санкт-Петербург',
+        },
+        'aphorism': aphorism.strip()
+    }
+    
+    # Сохраняем результат в XCom
+    context['ti'].xcom_push(key='weather_data', value=result)
+    
+    return result
 
 
 def summarize_news_with_gigachat(**context) -> str:
@@ -265,17 +388,47 @@ def prepare_email_content(**context) -> Dict[str, str]:
         if any(indicator in summary_lower for indicator in error_indicators):
             raise Exception(f"Саммари содержит ошибку: {summary[:200]}")
         
+        # Получаем данные о погоде из предыдущей задачи - обязательны!
+        weather_data = context['ti'].xcom_pull(key='weather_data', task_ids='get_weather_aphorism')
+        
+        if not weather_data:
+            raise Exception("Не удалось получить данные о погоде из предыдущей задачи")
+        
         # Формируем данные
-        titles = news_data.get('titles', []) if news_data else []
-        total_count = news_data.get('total_count', 0) if news_data else 0
+        if not news_data:
+            raise Exception("Не удалось получить данные новостей из предыдущей задачи")
+        
+        titles = news_data.get('titles', [])
+        total_count = news_data.get('total_count', 0)
         date_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Извлекаем данные о погоде - обязательны!
+        weather_info = weather_data.get('weather', {})
+        aphorism = weather_data.get('aphorism', '')
+        temp = weather_info.get('temperature')
+        condition = weather_info.get('condition')
+        
+        if not aphorism:
+            raise Exception("Не удалось получить афоризм о погоде")
+        if temp is None:
+            raise Exception("Не удалось получить температуру из данных о погоде")
+        
+        # Формируем блок с погодой и афоризмом
+        weather_block = f"""
+ПОГОДА В САНКТ-ПЕТЕРБУРГЕ:
+Температура: {temp}°C, Условия: {condition}
+
+{aphorism}
+
+---
+"""
         
         # Текстовая версия (для избежания спам-фильтров)
         text_content = f"""Саммари новостей о Bitcoin
 
 Дата: {date_str}
 Всего новостей: {total_count}
-
+{weather_block}
 САММАРИ:
 {summary}
 
@@ -286,6 +439,17 @@ def prepare_email_content(**context) -> Dict[str, str]:
         
         if total_count > 20:
             text_content += f"\n... и еще {total_count - 20} новостей\n"
+        
+        # Формируем HTML блок с погодой (данные уже проверены выше)
+        safe_aphorism = aphorism.replace('<', '&lt;').replace('>', '&gt;')
+        weather_html_block = f"""
+    <div style="background-color: #e8f4f8; padding: 15px; margin: 20px 0; border-left: 4px solid #4a90e2; border-radius: 4px;">
+        <h2 style="margin-top: 0; color: #2c3e50;">Погода в Санкт-Петербурге</h2>
+        <p style="margin: 5px 0;"><strong>Температура:</strong> {temp}°C</p>
+        <p style="margin: 5px 0;"><strong>Условия:</strong> {condition}</p>
+        <p style="margin: 15px 0 5px 0; font-style: italic; color: #555; border-top: 1px solid #ccc; padding-top: 10px;">{safe_aphorism}</p>
+    </div>
+"""
         
         # HTML версия (упрощенная, без сложных стилей)
         html_content = f"""<!DOCTYPE html>
@@ -299,7 +463,7 @@ def prepare_email_content(**context) -> Dict[str, str]:
     <h1 style="color: #333; border-bottom: 2px solid #333; padding-bottom: 10px;">Саммари новостей о Bitcoin</h1>
     <p><strong>Дата:</strong> {date_str}</p>
     <p><strong>Всего новостей:</strong> {total_count}</p>
-    
+{weather_html_block}
     <div style="background-color: #f9f9f9; padding: 15px; margin: 20px 0; border-left: 4px solid #333;">
         <h2 style="margin-top: 0;">Саммари:</h2>
         <p style="white-space: pre-wrap;">{summary.replace('<', '&lt;').replace('>', '&gt;')}</p>
@@ -334,15 +498,9 @@ def prepare_email_content(**context) -> Dict[str, str]:
         }
         
     except Exception as e:
+        # При ошибке падаем с исключением - никаких fallback
         error_msg = f"Ошибка при подготовке email: {str(e)}"
-        context['ti'].xcom_push(key='email_subject', value='Ошибка при подготовке саммари новостей')
-        context['ti'].xcom_push(key='email_text', value=error_msg)
-        context['ti'].xcom_push(key='email_html', value=f'<html><body><p>{error_msg}</p></body></html>')
-        return {
-            'subject': 'Ошибка при подготовке саммари новостей',
-            'text_content': error_msg,
-            'html_content': f'<html><body><p>{error_msg}</p></body></html>'
-        }
+        raise Exception(error_msg)
 
 
 def send_summary_email(**context):
@@ -404,6 +562,12 @@ get_news_task = PythonOperator(
     dag=dag,
 )
 
+get_weather_aphorism_task = PythonOperator(
+    task_id='get_weather_aphorism',
+    python_callable=get_weather_and_aphorism_task,
+    dag=dag,
+)
+
 summarize_news_task = PythonOperator(
     task_id='summarize_news',
     python_callable=summarize_news_with_gigachat,
@@ -423,5 +587,5 @@ send_email_task = PythonOperator(
 )
 
 # Определение последовательности выполнения задач
-get_news_task >> summarize_news_task >> prepare_email_task >> send_email_task
+get_news_task >> get_weather_aphorism_task >> summarize_news_task >> prepare_email_task >> send_email_task
 

@@ -9,26 +9,31 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 import requests
 
 
-# URL локального сервера новостей
+# URL локального объединенного MCP сервера (новости)
 # Для Docker используем host.docker.internal для доступа к хосту
 # Для Linux Docker может потребоваться IP адрес хоста (например, 172.17.0.1)
-NEWS_SERVER_URL = "http://host.docker.internal:8081"
+# Можно переопределить через переменную окружения NEWS_SERVER_URL
+NEWS_SERVER_URL = os.getenv(
+    'NEWS_SERVER_URL',
+    'http://host.docker.internal:8082/news'
+)
 
 
 def get_news_titles() -> Dict[str, Any]:
     """
     Получает заголовки новостей о Bitcoin.
     
-    Делает GET запрос к локальному MCP серверу новостей (news_server.py)
-    и возвращает заголовки новостей. Сервер должен быть запущен на порту 8081.
+    Делает GET запрос к объединенному MCP серверу (mcp_server.py)
+    по эндпоинту /news и возвращает заголовки новостей. Сервер должен быть запущен на порту 8082.
     
     Примечание: Для работы в Docker используется host.docker.internal для доступа к хосту.
-    Если news_server запущен на хосте, он должен быть доступен по этому адресу.
+    Если mcp_server запущен на хосте, он должен быть доступен по этому адресу.
     
     Returns:
         dict: JSON с массивом заголовков новостей или словарь с ошибкой,

@@ -1,3 +1,5 @@
 apache-airflow-providers-smtp
 gigachat
+requests
+python-dotenv
 
