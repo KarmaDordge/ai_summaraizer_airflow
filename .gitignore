@@ -1,0 +1,17 @@
+# GigaChat credentials (не коммитить в git!)
+config/gigachat_credentials.json
+
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Airflow
+logs/
+*.log
+
